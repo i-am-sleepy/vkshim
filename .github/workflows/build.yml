@@ -1,0 +1,167 @@
+name: build-vkshim
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch libadrenotools and Vulkan registry
+        run: |
+          git clone --recursive https://github.com/bylaws/libadrenotools.git
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
+
+      - name: Write sources
+        run: |
+          mkdir -p gen
+
+          cat > gen_shim.py <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          names = []
+          for cmds in root.findall("commands"):
+              for c in cmds.findall("command"):
+                  n = c.get("name")
+                  if n is None:
+                      p = c.find("proto/name")
+                      n = p.text if p is not None else None
+                  if n and n not in names:
+                      names.append(n)
+
+          with open(sys.argv[2], "w") as o:
+              o.write("#define VKSHIM_COUNT %d\n" % len(names))
+              o.write("static const char *const vkshim_names[VKSHIM_COUNT] = {\n")
+              for n in names:
+                  o.write('  "%s",\n' % n)
+              o.write("};\n")
+              for i, n in enumerate(names):
+                  off = i * 8
+                  o.write(
+                      'asm(".text\\n.globl %s\\n.type %s,%%function\\n.p2align 2\\n%s:\\n'
+                      'adrp x16, vkshim_table+%d\\nldr x16, [x16, :lo12:vkshim_table+%d]\\n'
+                      'br x16\\n.size %s, .-%s\\n");\n' % (n, n, n, off, off, n, n)
+                  )
+          EOF
+
+          cat > shim.cpp <<'EOF'
+          #include <dlfcn.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+          #include <android/log.h>
+          extern "C" {
+          #include <adrenotools/driver.h>
+          }
+          #include "shim_gen.inc"
+
+          extern "C" {
+          __attribute__((visibility("hidden"))) void *vkshim_table[VKSHIM_COUNT];
+          }
+
+          static std::string g_pkg;
+
+          static void logmsg(const char *fmt, ...) {
+            char buf[1024];
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(buf, sizeof(buf), fmt, ap);
+            va_end(ap);
+            __android_log_print(ANDROID_LOG_INFO, "vkshim", "%s", buf);
+            if (g_pkg.empty()) return;
+            std::string dir = "/storage/emulated/0/Android/data/" + g_pkg + "/files";
+            mkdir(dir.c_str(), 0771);
+            FILE *f = fopen((dir + "/vkshim.log").c_str(), "a");
+            if (f) {
+              fprintf(f, "%s\n", buf);
+              fclose(f);
+            }
+          }
+
+          extern "C" void vkshim_missing(void) {
+            logmsg("call to a Vulkan function the driver does not export");
+          }
+
+          __attribute__((constructor)) static void vkshim_init() {
+            char cmd[256] = {0};
+            FILE *c = fopen("/proc/self/cmdline", "r");
+            if (c) {
+              fread(cmd, 1, sizeof(cmd) - 1, c);
+              fclose(c);
+            }
+            g_pkg = cmd;
+            size_t colon = g_pkg.find(':');
+            if (colon != std::string::npos) g_pkg.resize(colon);
+
+            Dl_info di;
+            std::string libdir;
+            if (dladdr((void *)&vkshim_init, &di) && di.dli_fname) {
+              std::string so = di.dli_fname;
+              libdir = so.substr(0, so.rfind('/') + 1);
+            }
+            logmsg("vkshim start, pkg=%s libdir=%s", g_pkg.c_str(), libdir.c_str());
+
+            std::string tmp = "/data/data/" + g_pkg + "/files/vkshim_tmp/";
+            mkdir(("/data/data/" + g_pkg + "/files").c_str(), 0771);
+            mkdir(tmp.c_str(), 0771);
+
+            void *h = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM,
+                                                 tmp.c_str(), libdir.c_str(),
+                                                 libdir.c_str(), "vulkan.purple.so",
+                                                 nullptr, nullptr);
+            if (!h) {
+              logmsg("custom driver load FAILED, falling back to system libvulkan");
+              h = dlopen("libvulkan.so", RTLD_NOW);
+            } else {
+              logmsg("custom driver loaded");
+            }
+
+            int missing = 0;
+            for (int i = 0; i < VKSHIM_COUNT; i++) {
+              void *p = h ? dlsym(h, vkshim_names[i]) : nullptr;
+              if (!p) missing++;
+              vkshim_table[i] = p ? p : (void *)&vkshim_missing;
+            }
+            logmsg("table filled, %d of %d names unresolved", missing, VKSHIM_COUNT);
+          }
+          EOF
+
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(vkshim C CXX)
+          set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/out)
+          add_subdirectory(libadrenotools)
+          add_library(vkshim SHARED shim.cpp)
+          target_include_directories(vkshim PRIVATE ${CMAKE_SOURCE_DIR}/gen ${CMAKE_SOURCE_DIR}/libadrenotools/include)
+          target_link_libraries(vkshim PRIVATE adrenotools log dl)
+          target_link_options(vkshim PRIVATE -Wl,-z,max-page-size=16384)
+          EOF
+
+      - name: Generate trampolines
+        run: python3 gen_shim.py Vulkan-Headers/registry/vk.xml gen/shim_gen.inc
+
+      - name: Build
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4
+
+      - name: Collect libraries
+        run: |
+          mkdir -p out
+          find build -name "*.so" -exec cp -v {} out/ \;
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkshim-arm64
+          path: out/
